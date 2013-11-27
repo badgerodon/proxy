@@ -1,6 +1,6 @@
 {
   "badgerodon-proxy": {
-    "folder": ".",
+    "folder": "cmd",
     "build": "go",
     "type": "proxy"
   }
