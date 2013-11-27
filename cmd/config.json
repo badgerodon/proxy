@@ -1,0 +1,8 @@
+{
+	"port": 8888,
+	"routes": {
+		"localhost": {
+			"endpoints": ["http://127.0.0.1:8080"]
+		}
+	}
+}
