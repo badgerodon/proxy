@@ -1,187 +1,273 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
+	"crypto/tls"
+	"encoding/base64"
 	"fmt"
-	"github.com/howeyc/fsnotify"
+	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"path/filepath"
-	"strings"
 	"sync"
-	"sync/atomic"
+	"time"
 )
 
-func singleJoiningSlash(a, b string) string {
-	aslash := strings.HasSuffix(a, "/")
-	bslash := strings.HasPrefix(b, "/")
-	switch {
-	case aslash && bslash:
-		return a + b[1:]
-	case !aslash && !bslash:
-		return a + "/" + b
-	}
-	return a + b
-}
-
-func NewRoundRobinReverseProxy(endpoints []string) (*httputil.ReverseProxy, error) {
-	targets := make([]*url.URL, len(endpoints))
-	for i, endpoint := range endpoints {
-		var err error
-		targets[i], err = url.Parse(endpoint)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	var prev uint64
-	director := func(req *http.Request) {
-		target := targets[int(atomic.AddUint64(&prev, 1)%uint64(len(targets)))]
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.URL.Path = singleJoiningSlash(target.Path, req.URL.Path)
-		if target.RawQuery == "" || req.URL.RawQuery == "" {
-			req.URL.RawQuery = target.RawQuery + req.URL.RawQuery
-		} else {
-			req.URL.RawQuery = target.RawQuery + "&" + req.URL.RawQuery
-		}
-	}
-	return &httputil.ReverseProxy{Director: director}, nil
-}
+var (
+	ConnectTimeout     time.Duration = 30 * time.Second
+	RetryListenTimeout time.Duration = 5 * time.Second
+)
 
 type (
-	Proxy struct {
-		config         chan *Config
-		public, secure net.Listener
-		watcher        *fsnotify.Watcher
-		handlers       map[string]http.Handler
-		lock           sync.Mutex
+	proxy struct {
+		config    *Config
+		frontends map[int]net.Listener
+		backends  map[string]*backend
+
+		configChannel          chan *Config
+		incomingRequestChannel chan *incomingRequest
+		tlsConfigChannel       chan *tls.Config
+	}
+	backend struct {
+		endpoints []string
+		count     uint64
 	}
 )
 
-func NewProxy(filename string) (*Proxy, error) {
-	this := Proxy{
-		config: make(chan *Config, 1),
+func newProxy() *proxy {
+	return &proxy{
+		config:                 &Config{},
+		frontends:              make(map[int]net.Listener),
+		backends:               make(map[string]*backend),
+		configChannel:          make(chan *Config),
+		incomingRequestChannel: make(chan *incomingRequest),
+		tlsConfigChannel:       make(chan *tls.Config),
 	}
-	var err error
-	this.watcher, err = fsnotify.NewWatcher()
-	if err != nil {
-		return nil, err
-	}
-	go func() {
-		for {
-			select {
-			case evt := <-this.watcher.Event:
-				if evt.IsModify() && filepath.Base(evt.Name) == filepath.Base(filename) {
-					this.Reload(filename)
-				}
-			case err := <-this.watcher.Error:
-				log.Println("ERROR", err)
-			}
-		}
-	}()
-	err = this.watcher.Watch(filepath.Dir(filename))
-	if err != nil {
-		this.watcher.Close()
-		return nil, err
-	}
-	this.Reload(filename)
-	return &this, nil
 }
 
-// Reload the config
-func (this *Proxy) Reload(filename string) error {
+func (this *proxy) reload(filename string) {
 	cfg, err := GetConfig(filename)
+	if err != nil {
+		log.Println("error loading config:", err)
+		return
+	}
+	this.configChannel <- cfg
+}
+
+func (this *proxy) start() {
+	for {
+		select {
+		case cfg := <-this.configChannel:
+			log.Println("load config")
+
+			err := this.listen(cfg.Port)
+			if err != nil {
+				log.Println("error listening on", cfg.Port, ":", err)
+				time.AfterFunc(RetryListenTimeout, func() {
+					this.configChannel <- cfg
+				})
+				break
+			}
+
+			err = this.listenTLS(cfg.TLSPort)
+			if err != nil {
+				log.Println("error listening on", cfg.TLSPort, ":", err)
+				time.AfterFunc(RetryListenTimeout, func() {
+					this.configChannel <- cfg
+				})
+				break
+			}
+
+			this.backends = map[string]*backend{}
+			for host, route := range cfg.Routes {
+				be := &backend{route.Endpoints, 0}
+				this.backends[host] = be
+				log.Println(host, "-->", be.endpoints)
+			}
+
+			this.tlsConfigChannel <- this.getTLSConfig(cfg)
+
+			this.config = cfg
+		case ir := <-this.incomingRequestChannel:
+			if ir.err != nil {
+				ir.writeError(ir.err.Error(), 500)
+			} else if be, ok := this.backends[ir.request.Host]; ok {
+				endpoint := be.endpoints[be.count%uint64(len(be.endpoints))]
+				go this.join(ir, endpoint)
+				be.count++
+			} else {
+				ir.writeError(fmt.Sprintf("unknown host '%v'", ir.request.Host), 404)
+			}
+		}
+	}
+}
+
+func (this *proxy) getTLSConfig(cfg *Config) *tlsConfig {
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{},
+	}
+	for host, route := range cfg.Routes {
+		if route.TLS.Certificate != "" && route.TLS.Key != "" {
+			certBs, err := base64.StdEncoding.DecodeString(route.TLS.Certificate)
+			if err != nil {
+				log.Println("invalid certificate for", host)
+				continue
+			}
+			keyBs, err := base64.StdEncoding.DecodeString(route.TLS.Key)
+			if err != nil {
+				log.Println("invalid key for", host)
+				continue
+			}
+			cert, err := tls.X509KeyPair(certBs, keyBs)
+			if err != nil {
+				log.Println("invalid tls for", host)
+				continue
+			}
+			tlsConfig.Certificates = append(tlsConfig.Certificates, cert)
+		}
+	}
+	tlsConfig.BuildNameToCertificate()
+	return tlsConfig
+}
+
+func (this *proxy) listen(port int) error {
+	if port == this.config.Port {
+		return nil
+	}
+
+	l, ok := this.frontends[this.config.Port]
+	if ok {
+		l.Close()
+		delete(this.frontends, this.config.Port)
+	}
+
+	l, err := net.Listen("tcp", fmt.Sprint(":", port))
 	if err != nil {
 		return err
 	}
-	select {
-	case <-this.config:
-	default:
-	}
-	this.config <- cfg
+
+	go this.accept(l)
+	this.frontends[port] = l
+	this.config.Port = port
+
 	return nil
 }
 
-func (this *Proxy) Close() {
-	fmt.Println("Close")
-	if this.public != nil {
-		this.public.Close()
-		this.public = nil
+func (this *proxy) listenTLS(port int) error {
+	if port == this.config.TLSPort {
+		return nil
 	}
-	if this.secure != nil {
-		this.secure.Close()
-		this.secure = nil
+
+	l, ok := this.frontends[this.config.TLSPort]
+	if ok {
+		l.Close()
+		delete(this.frontends, this.config.TLSPort)
 	}
-	if this.watcher != nil {
-		this.watcher.Close()
-		this.watcher = nil
+
+	l, err := net.Listen("tcp", fmt.Sprint(":", port))
+	if err != nil {
+		return err
 	}
-	if this.config != nil {
-		close(this.config)
-		this.config = nil
+
+	go this.accept(l)
+	this.frontends[port] = l
+	this.config.TLSPort = port
+
+	return nil
+}
+
+func (this *proxy) accept(listener net.Listener) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Println("error accepting from", listener, ":", err)
+			return
+		}
+		go this.handleConn(conn)
 	}
 }
 
-func (this *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	this.lock.Lock()
-	handler, ok := this.handlers[r.Host]
-	if !ok && strings.Contains(r.Host, ":") {
-		handler, ok = this.handlers[r.Host[:strings.Index(r.Host, ":")]]
-	}
-	this.lock.Unlock()
+func (this *proxy) acceptTLS(listener net.Listener) {
+	conns := make(chan net.Conn)
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				log.Println("error accepting from", listener, ":", err)
+				break
+			}
+			conns <- conn
+		}
+		close(conns)
+	}()
 
-	if !ok {
-		http.Error(w, "Not Found", 404)
-		return
-	}
-
-	handler.ServeHTTP(w, r)
-}
-
-func (this *Proxy) ListenAndServe() error {
-	var prev *Config
-	var err error
+	config := <-this.tlsConfigChannel
 
 	for {
 		select {
-		case cfg, ok := <-this.config:
-			// Closed
+		case cfg := <-this.tlsConfigChannel:
+			config = cfg
+		case conn, ok := <-conns:
 			if !ok {
-				return nil
+				return
 			}
-
-			log.Println("Reload config: ", cfg)
-
-			handlers := make(map[string]http.Handler)
-			for host, route := range cfg.Routes {
-				handlers[host], err = NewRoundRobinReverseProxy(route.Endpoints)
-				if err != nil {
-					this.Close()
-					return err
-				}
-			}
-			this.lock.Lock()
-			this.handlers = handlers
-			this.lock.Unlock()
-
-			if prev == nil || prev.Port != cfg.Port {
-				if this.public != nil {
-					this.public.Close()
-				}
-				this.public, err = net.Listen("tcp", fmt.Sprint(":", cfg.Port))
-				if err != nil {
-					this.Close()
-					return err
-				}
-				go http.Serve(this.public, this)
-			}
-			if prev == nil || prev.SSLPort != cfg.SSLPort {
-				// TODO: setup SSL
-			}
-			prev = cfg
+			conn = tls.Server(conn, config)
+			go this.handleConn(conn)
 		}
 	}
+}
+
+func (this *proxy) handleConn(conn net.Conn) {
+	ir := &incomingRequest{
+		Conn:   conn,
+		buffer: bytes.NewBuffer(nil),
+	}
+	rdr := io.TeeReader(ir.Conn, ir.buffer)
+	ir.reader = bufio.NewReader(rdr)
+	ir.request, ir.err = http.ReadRequest(ir.reader)
+	this.incomingRequestChannel <- ir
+	if ir.request != nil {
+		log.Println(ir.request.Method, ir.request.URL)
+	}
+}
+
+func (this *proxy) join(ir *incomingRequest, endpoint string) {
+	conn, err := net.Dial("tcp", endpoint)
+	if err != nil {
+		log.Println("error connecting to", endpoint, ":", err)
+
+		if ir.opened.Add(-ConnectTimeout).After(time.Now()) {
+			ir.writeError("timeout", 504)
+		} else {
+			time.AfterFunc(time.Second, func() {
+				this.incomingRequestChannel <- ir
+			})
+		}
+
+		return
+	}
+
+	defer ir.Conn.Close()
+	defer conn.Close()
+
+	_, err = io.Copy(conn, ir.buffer)
+	if err != nil && err != io.EOF {
+		log.Println("error copying buffer to", conn.RemoteAddr(), ":", err)
+		return
+	}
+
+	var wg sync.WaitGroup
+	halfJoin := func(dst net.Conn, src net.Conn) {
+		defer wg.Done()
+		_, err := io.Copy(dst, src)
+		if err != nil {
+			log.Println("error copying from", src.RemoteAddr(), "to", dst.RemoteAddr(), ":", err)
+		}
+	}
+
+	wg.Add(2)
+	go halfJoin(ir.Conn, conn)
+	go halfJoin(conn, ir.Conn)
+	wg.Wait()
 }

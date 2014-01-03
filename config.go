@@ -6,18 +6,18 @@ import (
 )
 
 type (
-	SSL struct {
+	TLS struct {
 		Certificate string `json:"certificate"`
 		Key         string `json:"key"`
 	}
 	Entry struct {
 		Endpoints []string `json:"endpoints"`
-		SSL       SSL      `json:"ssl"`
+		TLS       TLS      `json:"tls"`
 	}
 	Config struct {
 		Routes  map[string]Entry `json:"routes"`
 		Port    int              `json:"port"`
-		SSLPort int              `json:"ssl_port"`
+		TLSPort int              `json:"tls_port"`
 	}
 )
 
