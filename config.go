@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 )
 
@@ -20,6 +21,10 @@ type (
 		TLSPort int              `json:"tls_port"`
 	}
 )
+
+func (this Entry) String() string {
+	return fmt.Sprintf("endpoints:%v tls:%v", this.Endpoints, this.TLS)
+}
 
 func GetConfig(filename string) (*Config, error) {
 	f, err := os.Open(filename)

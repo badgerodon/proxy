@@ -37,3 +37,7 @@ func TestProxyListen(t *testing.T) {
 		t.Errorf("expected frontends to contain only the most recent frontend")
 	}
 }
+
+func TestGetTLSConfig(t *testing.T) {
+
+}

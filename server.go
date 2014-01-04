@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/howeyc/fsnotify"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -36,12 +35,12 @@ func Listen(configFilename string) {
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatalln("error", err)
+		warn("watch error: %v", err)
 	}
 	defer watcher.Close()
 	err = watcher.Watch(filepath.Dir(configFilename))
 	if err != nil {
-		log.Fatalln("error", err)
+		warn("watch error: %v", err)
 	}
 	go func() {
 		for evt := range watcher.Event {
