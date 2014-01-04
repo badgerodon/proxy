@@ -20,5 +20,5 @@ func info(format string, args ...interface{}) {
 }
 
 func warn(format string, args ...interface{}) {
-	warn(format+"\n", args...)
+	log(format+"\n", args...)
 }

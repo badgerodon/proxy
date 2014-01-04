@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"github.com/howeyc/fsnotify"
@@ -15,7 +14,6 @@ import (
 type (
 	incomingRequest struct {
 		net.Conn
-		reader  *bufio.Reader
 		buffer  io.ReadWriter
 		request *http.Request
 		opened  time.Time

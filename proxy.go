@@ -64,6 +64,7 @@ func (this *proxy) start() {
 	for {
 		select {
 		case cfg := <-this.configChannel:
+			info("new config")
 			err := this.listen(cfg.Port)
 			if err != nil {
 				warn("listen error on port %v: %v", cfg.Port, err)
@@ -235,8 +236,7 @@ func (this *proxy) handleConn(conn net.Conn) {
 		opened: time.Now(),
 	}
 	rdr := io.TeeReader(ir.Conn, ir.buffer)
-	ir.reader = bufio.NewReader(rdr)
-	ir.request, ir.err = http.ReadRequest(ir.reader)
+	ir.request, ir.err = http.ReadRequest(bufio.NewReader(rdr))
 	if ir.request != nil {
 		info("%v %v", ir.request.Method, ir.request.URL)
 	} else {
@@ -250,7 +250,7 @@ func (this *proxy) join(ir *incomingRequest, endpoint string) {
 	if err != nil {
 		warn("join error to %v: %v", endpoint, err)
 
-		if ir.opened.Add(-ConnectTimeout).After(time.Now()) {
+		if ir.opened.Add(ConnectTimeout).Before(time.Now()) {
 			ir.writeError("timeout", 504)
 		} else {
 			time.AfterFunc(time.Second, func() {
@@ -265,7 +265,7 @@ func (this *proxy) join(ir *incomingRequest, endpoint string) {
 	defer conn.Close()
 
 	_, err = io.Copy(conn, ir.buffer)
-	if err != nil && err != io.EOF {
+	if err != nil {
 		warn("join copy buffer error: %v", err)
 		return
 	}
