@@ -103,7 +103,7 @@ func (this *proxy) start() {
 	}
 }
 
-func (this *proxy) getTLSConfig(cfg *Config) *tlsConfig {
+func (this *proxy) getTLSConfig(cfg *Config) *tls.Config {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{},
 	}
