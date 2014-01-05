@@ -95,8 +95,12 @@ func (this *proxy) start() {
 			this.config = cfg
 		case ir := <-this.incomingRequestChannel:
 			if ir.err != nil {
-				warn("request error: %v", ir.err)
-				go ir.writeError(ir.err.Error(), 500)
+				if ir.err != io.EOF {
+					warn("request error: %v", ir.err)
+					go ir.writeError(ir.err.Error(), 500)
+				} else {
+					ir.Conn.Close()
+				}
 			} else if be, ok := this.backends[ir.request.Host]; ok {
 				endpoint := be.endpoints[be.count%uint64(len(be.endpoints))]
 				go this.join(ir, endpoint)
@@ -239,8 +243,6 @@ func (this *proxy) handleConn(conn net.Conn) {
 	ir.request, ir.err = http.ReadRequest(bufio.NewReader(rdr))
 	if ir.request != nil {
 		info("%v %v", ir.request.Method, ir.request.URL)
-	} else {
-		warn("read request error: %v", ir.err)
 	}
 	this.incomingRequestChannel <- ir
 }
@@ -273,6 +275,8 @@ func (this *proxy) join(ir *incomingRequest, endpoint string) {
 	var wg sync.WaitGroup
 	halfJoin := func(dst net.Conn, src net.Conn) {
 		defer wg.Done()
+		defer dst.Close()
+		defer src.Close()
 		_, err := io.Copy(dst, src)
 		if err != nil {
 			warn("join copy error: %v", err)
